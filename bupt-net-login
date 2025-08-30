@@ -48,6 +48,61 @@ fatal() {
     exit 1
 }
 
+# 获取系统网卡列表
+get_network_interfaces() {
+    if command -v ip >/dev/null 2>&1; then
+        # Linux 系统使用 ip 命令
+        ip link show | grep -E '^[0-9]+:' | awk -F': ' '{print $2}' | sed 's/@.*//'
+    elif command -v ifconfig >/dev/null 2>&1; then
+        # macOS/BSD 系统使用 ifconfig 命令
+        ifconfig -l | tr ' ' '\n' | grep -v '^$'
+    else
+        warn "无法检测网卡，请手动指定网卡名称"
+        return 1
+    fi
+}
+
+# 检查网卡是否启用且有IP地址
+check_interface_status() {
+    local interface=$1
+    if command -v ip >/dev/null 2>&1; then
+        # Linux 系统
+        if ip addr show "$interface" 2>/dev/null | grep -q "inet "; then
+            return 0
+        fi
+    elif command -v ifconfig >/dev/null 2>&1; then
+        # macOS/BSD 系统
+        if ifconfig "$interface" 2>/dev/null | grep -q "inet "; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# 获取网卡的IP地址
+get_interface_ip() {
+    local interface=$1
+    if command -v ip >/dev/null 2>&1; then
+        # Linux 系统
+        ip addr show "$interface" 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d'/' -f1 | head -1
+    elif command -v ifconfig >/dev/null 2>&1; then
+        # macOS/BSD 系统
+        ifconfig "$interface" 2>/dev/null | grep "inet " | awk '{print $2}' | head -1
+    fi
+}
+
+# 使用指定网卡进行网络请求
+curl_with_interface() {
+    local interface=$1
+    shift
+    local ip=$(get_interface_ip "$interface")
+    if [[ -n "$ip" ]]; then
+        curl --interface "$interface" "$@"
+    else
+        curl "$@"
+    fi
+}
+
 ask_cred() {
     # already set username and password in environment variables, skip
     if [[ -n "$BUPT_USERNAME" && -n "$BUPT_PASSWORD" ]]; then
@@ -151,13 +206,41 @@ elif [[ "$1" == "uninstall" ]]; then
 
     echo "任何后台服务已清除，如果你需要删除 bupt-net-login 自身，运行 \"rm $(which bupt-net-login)\""
     exit 0
-elif [[ -n "$1" ]]; then
-    echo "bupt-net-login     - 北京邮电大学校园网认证脚本"
-    echo "Usage: $0 [install|uninstall]"
-    echo "                   - 不加参数即执行网关认证"
+elif [[ "$1" == "interfaces" ]]; then
+    echo "检测到的网卡列表："
+    echo "=================="
+    if get_network_interfaces; then
+        echo
+        echo "启用的网卡（有IP地址）："
+        echo "=================="
+        for interface in $(get_network_interfaces); do
+            if check_interface_status "$interface"; then
+                local ip=$(get_interface_ip "$interface")
+                echo "✓ $interface ($ip)"
+            else
+                echo "✗ $interface (未启用或无IP)"
+            fi
+        done
+    fi
+    exit 0
+elif [[ "$1" == "help" || "$1" == "--help" || "$1" == "-h" ]]; then
+    echo "bupt-net-login     - 北京邮电大学校园网认证脚本（网卡维度版）"
+    echo "Usage: $0 [install|uninstall|interfaces|help] [interface_name]"
+    echo "                   - 不加参数即执行网关认证（自动检测网卡）"
     echo "    install [cron] - 安装认证 cronjob, 定期检查登录。"
     echo "                     cron 参数可选，默认 cron 为 \"$cron\""
     echo "    uninstall      - 删除 cronjob 和保存的用户名密码"
+    echo "    interfaces     - 显示所有网卡信息"
+    echo "    help           - 显示此帮助信息"
+    echo "    [interface]    - 指定网卡名称进行认证"
+    echo ""
+    echo "示例："
+    echo "  $0                    # 自动检测网卡并认证"
+    echo "  $0 eth0              # 使用 eth0 网卡进行认证"
+    echo "  $0 wlp6s0            # 使用 wlp6s0 网卡进行认证"
+    echo "  $0 install           # 安装定时任务"
+    echo "  $0 interfaces        # 查看网卡信息"
+    echo "  $0 help              # 显示帮助信息"
     exit 0
 fi
 
@@ -184,16 +267,24 @@ cleanup() {
 trap cleanup EXIT
 
 login() {
-    redirected_auth_url=$1
+    local redirected_auth_url=$1
+    local interface=$2
+    
     if [[ -z "$redirected_auth_url" ]]; then
         error "未指定认证地址"
         return 1
     fi
 
-    info "准备使用账号 $BUPT_USERNAME 进行认证, 认证地址 $redirected_auth_url"
+    local interface_info=""
+    if [[ -n "$interface" ]]; then
+        local ip=$(get_interface_ip "$interface")
+        interface_info=" (网卡: $interface, IP: $ip)"
+    fi
+
+    info "准备使用账号 $BUPT_USERNAME 进行认证, 认证地址 $redirected_auth_url$interface_info"
 
     info "获取 cookie ..."
-    if ! curl $debug_args \
+    if ! curl_with_interface "$interface" $debug_args \
         -s -c "$cookie_file" \
         "$redirected_auth_url" >/dev/null; then
         error "获取 cookie 失败"
@@ -201,7 +292,7 @@ login() {
     fi
 
     info "正在认证..."
-    if ! curl $debug_args \
+    if ! curl_with_interface "$interface" $debug_args \
         -s -b "$cookie_file" \
         -X POST \
         --data-urlencode "user=$BUPT_USERNAME" \
@@ -211,43 +302,92 @@ login() {
         return 1
     fi
 
-    test_login
+    test_login "$interface"
 }
 
 test_login() {
-    curl $debug_args -4s "${REDIRECTION_TEST_URL}" | grep -q "Success"
+    local interface=$1
+    curl_with_interface "$interface" $debug_args -4s "${REDIRECTION_TEST_URL}" | grep -q "Success"
 }
 
 check_response() {
-    redirect_resp=$1
+    local redirect_resp=$1
+    local interface=$2
+    
     if [[ $redirect_resp == *Success* ]]; then
-        info "您已经登录, 无需进一步操作"
+        local interface_info=""
+        if [[ -n "$interface" ]]; then
+            interface_info=" (网卡: $interface)"
+        fi
+        info "您已经登录, 无需进一步操作$interface_info"
         exit 0
     elif [[ $redirect_resp == *10.3.8* ]]; then
-        info "您未登录, 准备认证..."
+        local interface_info=""
+        if [[ -n "$interface" ]]; then
+            interface_info=" (网卡: $interface)"
+        fi
+        info "您未登录, 准备认证...$interface_info"
         ask_cred
-        if login "$redirect_resp"; then
-            info "账号 $BUPT_USERNAME 认证成功"
+        if login "$redirect_resp" "$interface"; then
+            info "账号 $BUPT_USERNAME 认证成功$interface_info"
             exit 0
         else
-            fatal "账号 $BUPT_USERNAME 认证失败"
+            fatal "账号 $BUPT_USERNAME 认证失败$interface_info"
         fi
     elif [[ $redirect_resp == *http-equiv* ]]; then # 无线网，多一次跳转
         redirect_resp=$(echo "$redirect_resp " | grep -o "url=.*'")
         redirect_resp=${redirect_resp/url=/}
         redirect_resp=${redirect_resp/\'/}
         REDIRECTION_TEST_URL="${redirect_resp}"
-        main
+        main "$interface"
     else
-        error "收到来自 $REDIRECTION_TEST_URL 的未知响应: \"$redirect_resp\" 本次认证失败, 以下为 debug 信息"
-        curl -4vsS "${REDIRECTION_TEST_URL}"
+        local interface_info=""
+        if [[ -n "$interface" ]]; then
+            interface_info=" (网卡: $interface)"
+        fi
+        error "收到来自 $REDIRECTION_TEST_URL 的未知响应: \"$redirect_resp\" 本次认证失败$interface_info, 以下为 debug 信息"
+        curl_with_interface "$interface" -4vsS "${REDIRECTION_TEST_URL}"
         exit 1
     fi
 }
 
 main() {
-    redirect_resp="$(curl $debug_args -4sS -w '%{redirect_url}' "${REDIRECTION_TEST_URL}")"
-    check_response "$redirect_resp"
+    local interface=$1
+    
+    # 如果没有指定网卡，自动检测
+    if [[ -z "$interface" ]]; then
+        info "未指定网卡，正在自动检测..."
+        local available_interfaces=()
+        
+        for iface in $(get_network_interfaces); do
+            if check_interface_status "$iface"; then
+                available_interfaces+=("$iface")
+            fi
+        done
+        
+        if [[ ${#available_interfaces[@]} -eq 0 ]]; then
+            fatal "未找到可用的网卡"
+        elif [[ ${#available_interfaces[@]} -eq 1 ]]; then
+            interface=${available_interfaces[0]}
+            info "自动选择网卡: $interface"
+        else
+            info "检测到多个可用网卡: ${available_interfaces[*]}"
+            info "将使用第一个可用网卡: ${available_interfaces[0]}"
+            interface=${available_interfaces[0]}
+        fi
+    else
+        # 检查指定的网卡是否可用
+        if ! check_interface_status "$interface"; then
+            fatal "指定的网卡 $interface 不可用或无IP地址"
+        fi
+        info "使用指定网卡: $interface"
+    fi
+    
+    local interface_info=" (网卡: $interface)"
+    info "开始检测网络状态$interface_info"
+    
+    redirect_resp="$(curl_with_interface "$interface" $debug_args -4sS -w '%{redirect_url}' "${REDIRECTION_TEST_URL}")"
+    check_response "$redirect_resp" "$interface"
 }
 
-main
+main "$1"
